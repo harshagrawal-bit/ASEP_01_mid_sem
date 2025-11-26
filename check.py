@@ -3,6 +3,8 @@ import csv
 from datetime import datetime
 from tapo import ApiClient
 
+
+
 EMAIL = "harshagrawal.6996@gmail.com"
 PASSWORD = "10Harsh2006"
 IP = "192.168.0.108"
