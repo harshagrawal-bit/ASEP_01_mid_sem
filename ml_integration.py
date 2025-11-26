@@ -38,7 +38,30 @@ CSV_FILE = "energy_data.csv"
 
         
 synthetic_dataset = pd.read_csv("synthetic_energy_data.csv")
-print(synthetic_dataset.tail());
+# print(synthetic_dataset['is_peak_hour_house'].value_counts())
+X= synthetic_dataset[[
+    "date",
+    "hour",
+    "household_id",
+    "plug_1_avg_W",
+    "plug_2_avg_W",
+    "plug_3_avg_W",
+    "plug_4_avg_W",
+    "total_power_W"
+]]
+
+Y = synthetic_dataset["is_peak_hour_house"]
+# print(X.head())
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2,random_state=4)
+model = LogisticRegression()
+model.fit(X_train,Y_train)
+training_data_prediction = model.predict(X_train)
+test_data_prediction = model.predict(X_test)
+
+print("Accuracy:", accuracy_score(Y_train, training_data_prediction))
+#print(classification_report(y_test, y_pred))
+
 
 
 
