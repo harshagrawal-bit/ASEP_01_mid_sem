@@ -4,33 +4,34 @@ from collections import deque
 
 import joblib
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
 from tapo import ApiClient
 
 # -----------------------
-# CONFIG
+# CONFIG - PRODUCTION VERSION
 # -----------------------
-EMAIL = "YOUR_EMAIL"
-PASSWORD = "YOUR_PASSWORD"
-IP = "192.168.0.108"
+EMAIL = "harshagrawal.6996@gmail.com"
+PASSWORD = "10Harsh2006"
+IP = "192.168.0.104"
 
-READ_INTERVAL_SEC = 5            # keep 5s for demo
-PEAK_THRESHOLD_W = 300
+READ_INTERVAL_SEC = 10           # Less frequent for stability
+PEAK_THRESHOLD_W = 300           # Realistic threshold (300W)
 PAUSE_TIME_SEC = 300             # 5 minutes
 
-# gating thresholds (probabilities)
-HOUR_GATE_PROBA = 0.60
-QUARTER_GATE_PROBA = 0.60
+# gating thresholds (probabilities) - realistic
+HOUR_GATE_PROBA = 0.60          # Only proceed if 60%+ confidence
+QUARTER_GATE_PROBA = 0.60       # Only proceed if 60%+ confidence
 
 # models
 HOUR_MODEL_PATH = "hour_peak_classifier.pkl"
 QUARTER_MODEL_PATH = "quarter_peak_classifier.pkl"
 
-# 5-min ahead predictor settings
-FORECAST_HORIZON_SEC = 300       # 5 minutes
-MIN_TRAIN_SAMPLES = 80           # need some history (80 samples @ 5s ≈ 6.6 min)
-LAG_COUNT = 12                   # last 12 samples = last 1 minute (12*5s)
+# 5-min ahead predictor settings - REALISTIC
+FORECAST_HORIZON_SEC = 300       # Predict 5 minutes ahead
+MIN_TRAIN_SAMPLES = 80           # Need solid history
+LAG_COUNT = 12                   # Last 12 samples (2 minutes of history)
 
 # -----------------------
 # HELPERS
@@ -66,14 +67,15 @@ async def connect_device():
         return None
 
 def build_lag_features(series, idx, lag_count):
-    # series: list of floats
-    # idx: current index in series for which we build features using past values
-    # returns vector length lag_count + 2 (rolling mean + slope)
-    lags = [series[idx - k] for k in range(1, lag_count + 1)]  # last lag_count values
+    """Build lag features for time series forecasting"""
+    if idx < lag_count:
+        return None
+    
+    lags = [series[idx - k] for k in range(1, lag_count + 1)]
     lags = lags[::-1]  # oldest -> newest
 
     rolling_mean = float(np.mean(lags))
-    slope = float(lags[-1] - lags[0])  # simple trend over the window
+    slope = float(lags[-1] - lags[0])
 
     return lags + [rolling_mean, slope]
 
@@ -96,7 +98,7 @@ async def main():
     if device is None:
         return
 
-    # For inactive plugs, use averages from 15-min dataset means
+    # For inactive plugs, use averages
     q_p2 = float(quarter_means.get("plug_2_15m_W", 0.0))
     q_p3 = float(quarter_means.get("plug_3_15m_W", 0.0))
     q_p4 = float(quarter_means.get("plug_4_15m_W", 0.0))
@@ -104,12 +106,16 @@ async def main():
 
     # Online training buffers
     times = []
-    p1_series = []  # plug1 watts
+    p1_series = []
 
-    # Online regressor (retrained occasionally)
+    # Online regressor
     reg = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
     reg_ready = False
     last_train_size = 0
+
+    print("\n🏭 PRODUCTION MODE: Full hierarchical gating enabled")
+    print(f"   Threshold: {PEAK_THRESHOLD_W}W | Horizon: {FORECAST_HORIZON_SEC}s | Pause: {PAUSE_TIME_SEC}s")
+    print(f"   Gates: Hour≥{HOUR_GATE_PROBA} & Quarter≥{QUARTER_GATE_PROBA}\n")
 
     while True:
         now = datetime.now()
@@ -151,11 +157,12 @@ async def main():
             "plug_3_avg_W": p3,
             "plug_4_avg_W": p4
         }
-        X_hour = [[hour_row[f] for f in hour_features]]
+        X_hour = pd.DataFrame([[hour_row[f] for f in hour_features]], columns=hour_features)
         p_peak_hour = float(hour_model.predict_proba(X_hour)[0][1])
         print(f"🧠 P(next hour peak) = {p_peak_hour:.2f}")
 
         if p_peak_hour < HOUR_GATE_PROBA:
+            print(f"   ✋ Hour gate: probability {p_peak_hour:.2f} < {HOUR_GATE_PROBA}, skipping fine prediction")
             await asyncio.sleep(READ_INTERVAL_SEC)
             continue
 
@@ -174,79 +181,94 @@ async def main():
             "total_power_15m_W": q_total_mean,
             "is_peak_hour_house": 1
         }
-        X_q = [[quarter_row[f] for f in quarter_features]]
+        X_q = pd.DataFrame([[quarter_row[f] for f in quarter_features]], columns=quarter_features)
         p_peak_quarter = float(quarter_model.predict_proba(X_q)[0][1])
         print(f"🧠 P(next quarter peak) = {p_peak_quarter:.2f}")
 
         if p_peak_quarter < QUARTER_GATE_PROBA:
+            print(f"   ✋ Quarter gate: probability {p_peak_quarter:.2f} < {QUARTER_GATE_PROBA}, monitoring only")
             await asyncio.sleep(READ_INTERVAL_SEC)
             continue
 
-        # ---- Online 5-min ahead prediction (plug_1)
-        # Build training set from what we've collected so far:
-        # X(t) = lags up to 1 minute, y(t) = power at t + horizon
-        horizon_steps = max(1, int(FORECAST_HORIZON_SEC / READ_INTERVAL_SEC))
+        print(f"   🚨 Both gates passed: entering high-alert mode")
 
-        # Need enough points so that: idx - LAG_COUNT >= 0 and idx + horizon_steps < len(series)
+        # ---- Online predictor training
+        horizon_steps = max(1, int(FORECAST_HORIZON_SEC / READ_INTERVAL_SEC))
         max_idx_for_train = len(p1_series) - horizon_steps - 1
 
         if max_idx_for_train >= LAG_COUNT and len(p1_series) >= MIN_TRAIN_SAMPLES:
-            # retrain only when dataset has grown a bit (avoids retrain every loop)
-            if len(p1_series) - last_train_size >= 20:
+            # retrain when dataset grows significantly
+            if len(p1_series) - last_train_size >= 20 or not reg_ready:
                 X_train = []
                 y_train = []
-                for idx in range(LAG_COUNT, max_idx_for_train):
-                    X_train.append(build_lag_features(p1_series, idx, LAG_COUNT))
-                    y_train.append(p1_series[idx + horizon_steps])
+                
+                for idx in range(LAG_COUNT, max_idx_for_train + 1):
+                    features = build_lag_features(p1_series, idx, LAG_COUNT)
+                    if features is not None:
+                        X_train.append(features)
+                        y_train.append(p1_series[idx + horizon_steps])
 
-                X_train = np.array(X_train, dtype=float)
-                y_train = np.array(y_train, dtype=float)
+                if len(X_train) > 0:
+                    X_train = np.array(X_train, dtype=float)
+                    y_train = np.array(y_train, dtype=float)
 
-                reg.fit(X_train, y_train)
-                reg_ready = True
-                last_train_size = len(p1_series)
-                print(f"✅ 5-min predictor trained on {len(X_train)} samples")
+                    reg.fit(X_train, y_train)
+                    reg_ready = True
+                    last_train_size = len(p1_series)
+                    print(f"✅ 5-min predictor trained on {len(X_train)} samples")
 
         if not reg_ready:
-            print(f"⌛ Collecting data for 5-min predictor... ({len(p1_series)}/{MIN_TRAIN_SAMPLES})")
+            need = MIN_TRAIN_SAMPLES + LAG_COUNT + horizon_steps
+            print(f"⌛ Collecting data for 5-min predictor... ({len(p1_series)}/{need})")
             await asyncio.sleep(READ_INTERVAL_SEC)
             continue
 
-        # Predict 5 minutes ahead from latest lag window
+        # ---- Predict 5 minutes ahead
         idx_now = len(p1_series) - 1
         if idx_now >= LAG_COUNT:
-            X_now = np.array([build_lag_features(p1_series, idx_now, LAG_COUNT)], dtype=float)
-            plug1_5min_pred = float(reg.predict(X_now)[0])
-            print(f"🔮 Predicted plug_1 in +5 min: {plug1_5min_pred:.2f} W")
+            features_now = build_lag_features(p1_series, idx_now, LAG_COUNT)
+            if features_now is not None:
+                X_now = np.array([features_now], dtype=float)
+                plug1_5min_pred = float(reg.predict(X_now)[0])
+                print(f"🔮 Predicted plug_1 in +5 min: {plug1_5min_pred:.2f} W")
 
-            # Convert to predicted total by adding avg of other plugs
-            total_5min_pred = plug1_5min_pred + q_p2 + q_p3 + q_p4
-            print(f"🔮 Predicted TOTAL in +5 min: {total_5min_pred:.2f} W (threshold {PEAK_THRESHOLD_W} W)")
+                # Convert to predicted total by adding avg of other plugs
+                total_5min_pred = plug1_5min_pred + q_p2 + q_p3 + q_p4
+                print(f"🔮 Predicted TOTAL in +5 min: {total_5min_pred:.2f} W (threshold {PEAK_THRESHOLD_W} W)")
 
-            if total_5min_pred > PEAK_THRESHOLD_W:
-                print("⚠ Forecast says threshold will be exceeded in ~5 minutes.")
-                choice = input("Override? Keep plug ON (y/n): ").strip().lower()
+                if total_5min_pred > PEAK_THRESHOLD_W:
+                    print("⚠ PEAK ALERT: Threshold will be exceeded in ~5 minutes!")
+                    print("🔌 Plug will turn OFF automatically to prevent peak...")
+                    
+                    # Give user 5 seconds to respond
+                    for i in range(5, 0, -1):
+                        print(f"   Press 'y' within {i} seconds to keep plug ON... ", end="\r")
+                        await asyncio.sleep(1)
+                    
+                    print("\n")
+                    
+                    choice = input("❓ Keep plug ON? (y=YES, any other key=turn OFF): ").strip().lower()
 
-                if choice == "y":
-                    print("✅ Override accepted: plug stays ON.")
-                else:
-                    print("🔌 Turning plug OFF now (preventive action)...")
-                    try:
-                        await device.off()
-                    except Exception as e:
-                        print("❌ Failed to turn OFF:", repr(e))
-                        await asyncio.sleep(READ_INTERVAL_SEC)
-                        continue
-
-                    await countdown(PAUSE_TIME_SEC)
-
-                    print("🔌 Turning plug ON...")
-                    try:
-                        await device.on()
-                    except Exception as e:
-                        print("❌ Failed to turn ON:", repr(e))
+                    if choice == "y":
+                        print("✅ User override: plug stays ON.")
                     else:
-                        print("🔁 Plug resumed.")
+                        print("🔌 Turning plug OFF now (preventive peak shaving)...")
+                        try:
+                            await device.off()
+                        except Exception as e:
+                            print("❌ Failed to turn OFF:", repr(e))
+                            await asyncio.sleep(READ_INTERVAL_SEC)
+                            continue
+
+                        await countdown(PAUSE_TIME_SEC)
+
+                        print("🔌 Turning plug ON...")
+                        try:
+                            await device.on()
+                        except Exception as e:
+                            print("❌ Failed to turn ON:", repr(e))
+                        else:
+                            print("🔁 Plug resumed. System back to monitoring mode.")
 
         await asyncio.sleep(READ_INTERVAL_SEC)
 

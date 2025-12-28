@@ -7,7 +7,7 @@ from tapo import ApiClient
 
 EMAIL = "harshagrawal.6996@gmail.com"
 PASSWORD = "10Harsh2006"
-IP = "192.168.0.108"
+IP = "192.168.0.104"
 CSV_FILE = "energy_data.csv"
 
 async def live_power():
